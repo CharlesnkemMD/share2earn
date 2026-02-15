@@ -1,0 +1,303 @@
+# Share2Earn – Full Stack (Frontend + Backend)
+
+This is a **working v1 scaffold** implementing your exact rules:
+- Referral earning: NGN 4,000 per verified referral
+- Tiered withdrawal limits:
+  - Tier 1: min NGN 25,000
+  - Tier 2: min NGN 10,000
+  - Tier 3: no minimum
+- Manual verification & withdrawals via WhatsApp: 09011876086
+- Blue-only theme
+
+---
+
+## 1) Backend (Node.js + Express + MongoDB)
+
+### Folder structure
+```
+backend/
+  ├─ models/
+  │   └─ User.js
+  ├─ routes/
+  │   ├─ auth.js
+  │   ├─ user.js
+  │   └─ admin.js
+  ├─ middleware/
+  │   └─ auth.js
+  ├─ server.js
+  └─ .env
+```
+
+### backend/.env
+```
+PORT=5000
+MONGO_URI=your_mongodb_uri
+JWT_SECRET=super_secret_key
+```
+
+### backend/server.js
+```js
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error(err));
+
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/user', require('./routes/user'));
+app.use('/api/admin', require('./routes/admin'));
+
+app.listen(process.env.PORT, () =>
+  console.log(`Server running on port ${process.env.PORT}`)
+);
+```
+
+### backend/models/User.js
+```js
+const mongoose = require('mongoose');
+
+const TransactionSchema = new mongoose.Schema({
+  type: { type: String, enum: ['referral', 'withdrawal', 'tier-upgrade'], required: true },
+  amount: { type: Number, required: true },
+  description: String,
+  date: { type: Date, default: Date.now }
+});({
+  type: { type: String, enum: ['referral', 'withdrawal'], required: true },
+  amount: { type: Number, required: true },
+  description: String,
+  date: { type: Date, default: Date.now }
+});
+
+const UserSchema = new mongoose.Schema({
+  username: { type: String, unique: true },
+  email: { type: String, unique: true },
+  password: String,
+  referralCode: String,
+  referredBy: { type: String, default: null },
+  referrals: { type: Number, default: 0 },
+  balance: { type: Number, default: 0 },
+  tier: { type: Number, default: 1 }, // 1, 2, 3
+  verified: { type: Boolean, default: false },
+  role: { type: String, default: 'user' },
+  transactions: [TransactionSchema]
+}, { timestamps: true });
+
+module.exports = mongoose.model('User', UserSchema);
+```
+
+### backend/middleware/auth.js
+```js
+const jwt = require('jsonwebtoken');
+
+module.exports = function (req, res, next) {
+  const token = req.headers['authorization'];
+  if (!token) return res.status(401).json({ msg: 'No token' });
+
+  try {
+    const decoded = jwt.verify(token.split(' ')[1], process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch {
+    res.status(401).json({ msg: 'Invalid token' });
+  }
+};
+```
+
+### backend/routes/auth.js
+```js
+const router = require('express').Router();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+router.post('/register', async (req, res) => {
+  const { username, email, password, ref } = req.body;
+  const hashed = await bcrypt.hash(password, 10);
+
+  const user = await User.create({
+    username,
+    email,
+    password: hashed,
+    referralCode: username,
+    referredBy: ref || null
+  });
+
+  res.json({ msg: 'Registered successfully' });
+});
+
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  if (!user) return res.status(400).json({ msg: 'Invalid credentials' });
+
+  const match = await bcrypt.compare(password, user.password);
+  if (!match) return res.status(400).json({ msg: 'Invalid credentials' });
+
+  const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET);
+  res.json({ token });
+});
+
+router.post('/upgrade-tier', auth, async (req, res) => {
+  const user = await User.findById(req.user.id);
+
+  const costs = { 1: 7000, 2: 12000, 3: 35000 };
+  const nextTier = user.tier + 1;
+
+  if (nextTier > 3) return res.status(400).json({ msg: 'Already at max tier' });
+  if (user.balance < costs[nextTier])
+    return res.status(400).json({ msg: 'Insufficient balance for upgrade' });
+
+  user.balance -= costs[nextTier];
+  user.tier = nextTier;
+
+  user.transactions.push({
+    type: 'tier-upgrade',
+    amount: costs[nextTier],
+    description: `Upgraded to Tier ${nextTier}`
+  });
+
+  await user.save();
+  res.json({ msg: `Upgraded to Tier ${nextTier}`, tier: user.tier });
+});
+
+router.get('/transactions', auth, async (req, res) => {
+  const user = await User.findById(req.user.id).select('transactions');
+  res.json
+```
+
+### backend/routes/user.js
+```js
+const router = require('express').Router();
+const auth = require('../middleware/auth');
+const User = require('../models/User');
+
+const REFERRAL_BONUS = 4000;
+
+router.get('/me', auth, async (req, res) => {
+  const user = await User.findById(req.user.id).select('-password');
+  res.json(user);
+});
+
+router.post('/withdraw', auth, async (req, res) => {
+  const { amount } = req.body;
+  const user = await User.findById(req.user.id);
+
+  const min = user.tier === 1 ? 25000 : user.tier === 2 ? 10000 : 0;
+  if (amount < min) return res.status(400).json({ msg: 'Below minimum withdrawal' });
+  if (amount > user.balance) return res.status(400).json({ msg: 'Insufficient balance' });
+
+  user.transactions.push({
+    type: 'withdrawal',
+    amount,
+    description: 'Withdrawal request (manual approval)'
+  });
+
+  await user.save();
+
+  res.json({({({
+    whatsapp:
+      `https://wa.me/2349011876086?text=Withdrawal%20Request%0AUsername:%20${user.username}%0AAmount:%20NGN${amount}`
+  });
+});
+
+module.exports = router;
+```
+
+### backend/routes/admin.js
+```js
+const router = require('express').Router();
+const auth = require('../middleware/auth');
+const User = require('../models/User');
+
+router.post('/verify/:id', auth, async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user || user.verified) return res.status(400).json({ msg: 'Invalid user' });
+
+  user.verified = true;
+  await user.save();
+
+  if (user.referredBy) {
+    const referrer = await User.findOne({ referralCode: user.referredBy });
+    if (referrer) {
+      referrer.balance += 4000;
+      referrer.transactions.push({
+        type: 'referral',
+        amount: 4000,
+        description: `Referral bonus from ${user.username}`
+      });
+      referrer.referrals += 1;
+      // Tier auto-upgrade rules REMOVED (manual upgrade only)
+      await referrer.save();
+    }
+  }
+
+  res.json({ msg: 'User verified and bonus applied' });
+});
+
+module.exports = router;
+```
+
+---
+
+## 2) Frontend (React + Tailwind)
+
+### Folder structure
+```
+frontend/
+  ├─ src/
+  │   ├─ pages/
+  │   │   ├─ Home.jsx
+  │   │   ├─ Login.jsx
+  │   │   ├─ Register.jsx
+  │   │   ├─ Dashboard.jsx
+  │   │   └─ Withdraw.jsx
+  │   ├─ App.jsx
+  │   └─ main.jsx
+```
+
+### Withdraw.jsx (WhatsApp logic)
+```jsx
+import axios from 'axios';
+
+export default function Withdraw() {
+  const submit = async (amount) => {
+    const res = await axios.post('/api/user/withdraw', { amount }, {
+      headers: { Authorization: `Bearer ${localStorage.token}` }
+    });
+    window.location.href = res.data.whatsapp;
+  };
+
+  return (
+    <button onClick={() => submit(25000)} className="bg-blue-600 text-white p-3">
+      Withdraw
+    </button>
+  );
+}
+```
+
+---
+
+## 3) What you can do next
+
+1. Run backend:
+```
+cd backend
+npm install
+node server.js
+```
+
+2. Run frontend:
+```
+cd frontend
+npm install
+npm run dev
+```
+
+
